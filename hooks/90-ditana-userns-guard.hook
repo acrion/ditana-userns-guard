@@ -1,0 +1,17 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Path
+Target = usr/bin/*
+Target = usr/lib/*
+
+[Action]
+# The guard matches executables by device and inode, so replacing one of the
+# allowed binaries makes the running allowlist point at a file that no longer
+# exists. Nothing would report that: the sandbox would simply stop being
+# permitted. The reload is a handful of open calls and does nothing at all on a
+# machine where the guard is not running.
+Description = Refreshing the unprivileged user namespace allowlist...
+When = PostTransaction
+Exec = /usr/bin/ditana-userns-guard --reload

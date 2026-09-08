@@ -1,0 +1,35 @@
+[Unit]
+Description=Restrict unprivileged user namespaces to declared executables
+Documentation=https://github.com/acrion/ditana-userns-guard
+
+# The order of the two ExecStart lines below is the entire safety argument, and
+# it only holds if this unit runs after the sysctl files have been applied.
+# systemd-sysctl writes kernel.unprivileged_userns_clone=0 from
+# /etc/sysctl.d/ditana.conf, and raising it before that would simply be undone.
+DefaultDependencies=no
+After=systemd-sysctl.service local-fs.target
+Before=sysinit.target
+
+# Without a list there is nothing to permit, and the machine keeps the sysctl
+# it was installed with.
+ConditionPathExists=/etc/ditana/userns-allow.conf
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+
+# A BPF LSM hook can only deny, never grant, so the allowlist is worthless while
+# the sysctl refuses every unprivileged user namespace outright. Raising it is
+# what puts the guard in charge - and it happens only on the second line, which
+# systemd does not reach if the first one failed. A machine that cannot load the
+# program therefore stays exactly as locked as it was before this unit ran.
+ExecStart=/usr/bin/ditana-userns-guard
+ExecStart=/usr/bin/sysctl --quiet --write kernel.unprivileged_userns_clone=1
+
+# Stopping reverses that order for the same reason: lower the sysctl first, and
+# only then take the guard away.
+ExecStop=/usr/bin/sysctl --quiet --write kernel.unprivileged_userns_clone=0
+ExecStop=/usr/bin/ditana-userns-guard --unload
+
+[Install]
+WantedBy=sysinit.target

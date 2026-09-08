@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# These tests need root, because attaching a BPF LSM program does, and they need
+# a kernel with CONFIG_BPF_LSM and bpf in the LSM stack.
+#
+# The enforcing tests deny unprivileged user namespaces machine-wide for as long
+# as they run. On a desktop that can take a browser tab or a running Flatpak with
+# it, so they refuse to run where a graphical session is present unless
+# DITANA_USERNS_TEST_ENFORCE=yes says the machine is expendable.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+GUARD="$ROOT/build/ditana-userns-guard"
+OBJECT="$ROOT/build/userns_guard.bpf.o"
+WORK="$(mktemp -d)"
+SYSCTL_BEFORE=""
+LOOPMNT=""
+
+pass=0; fail=0; skip=0
+ok()   { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no()   { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+skp()  { printf '  skip %s (%s)\n' "$1" "$2"; skip=$((skip+1)); }
+is()   { if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1: expected '$3', got '$2'"; fi }
+
+cleanup() {
+    "$GUARD" --unload >/dev/null 2>&1
+    [[ -n $LOOPMNT ]] && umount "$LOOPMNT" 2>/dev/null
+    [[ -n $SYSCTL_BEFORE ]] && sysctl -q -w "kernel.unprivileged_userns_clone=$SYSCTL_BEFORE"
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+[[ $EUID -eq 0 ]] || { echo "SKIP: these tests need root"; exit 0; }
+[[ -x $GUARD && -f $OBJECT ]] || { echo "FAIL: run 'make' first"; exit 1; }
+
+USER_NAME="${SUDO_USER:-nobody}"
+as_user() { setpriv --reuid "$(id -u "$USER_NAME")" --regid "$(id -g "$USER_NAME")" --clear-groups "$@"; }
+
+SYSCTL_BEFORE="$(sysctl -n kernel.unprivileged_userns_clone)"
+sysctl -q -w kernel.unprivileged_userns_clone=1
+
+# A distinct copy per case, because the guard matches the inode: two cases must
+# not be able to pass by accident through sharing one file.
+probe() { local p="$WORK/$1"; mkdir -p "$(dirname "$p")"; cp /usr/bin/unshare "$p"; chmod 755 "$p"; echo "$p"; }
+makes_ns() { as_user "$1" --user /bin/true >/dev/null 2>&1; }
+counter()  { "$GUARD" --status | awk -v k="$1" '$1==k{print $2}'; }
+
+# A skipped test that does not say why is barely a test at all: the loop mount
+# failed once on a machine that had btrfs-progs and a btrfs filesystem, and the
+# reason was thrown away with 2>/dev/null.
+LOOP_ERROR=""
+loop_btrfs() {
+    local img="$1" mnt="$2" out
+    truncate -s 300M "$img"
+    if ! out=$(mkfs.btrfs -q "$img" 2>&1); then
+        LOOP_ERROR="mkfs.btrfs: ${out//$'\n'/ }"
+        return 1
+    fi
+    if ! out=$(mount -o loop "$img" "$mnt" 2>&1); then
+        LOOP_ERROR="mount: ${out//$'\n'/ }"
+        return 1
+    fi
+    return 0
+}
+
+echo "== observing: the allowlist decides, nothing is refused =="
+ALLOWED="$(probe allowed/probe)"
+DENIED="$(probe denied/probe)"
+printf '%s\n' "$ALLOWED" > "$WORK/allow.conf"
+"$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null || no "attach"
+
+before_a="$(counter allowed)"; before_d="$(counter denied)"
+makes_ns "$ALLOWED" && ok "an allowed binary still runs" || no "an allowed binary still runs"
+makes_ns "$DENIED"  && ok "an unlisted binary still runs while only observing" \
+                    || no "an unlisted binary still runs while only observing"
+is "the allowed one was counted as allowed" "$(( $(counter allowed) - before_a ))" 1
+is "the unlisted one was counted as denied" "$(( $(counter denied)  - before_d ))" 1
+"$GUARD" --unload
+
+echo
+echo "== the device number must come from the kernel, not from stat() =="
+# This is a regression test with a measurement behind it. The first version of
+# the guard built its key from stat(), which on btrfs reports the anonymous
+# device of the subvolume while the kernel keeps the superblock's own number in
+# i_sb->s_dev. A bwrap copy on btrfs was then silently never matched - the guard
+# denied a binary that was on its allowlist. zfs and tmpfs happen to agree,
+# which is what makes the mistake easy to ship unnoticed.
+if ! command -v mkfs.btrfs >/dev/null; then
+    skp "an allowed binary on btrfs is matched" "btrfs-progs is not installed"
+else
+    LOOPMNT="$WORK/btrfs"; mkdir -p "$LOOPMNT"
+    if loop_btrfs "$WORK/btrfs.img" "$LOOPMNT"; then
+        # A subvolume, because that is where the two device numbers part ways.
+        btrfs subvolume create "$LOOPMNT/sub" >/dev/null
+        cp /usr/bin/unshare "$LOOPMNT/sub/probe"; chmod 755 "$LOOPMNT/sub/probe"
+        printf '%s\n' "$LOOPMNT/sub/probe" > "$WORK/allow.conf"
+        "$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
+        b="$(counter allowed)"
+        makes_ns "$LOOPMNT/sub/probe"
+        is "an allowed binary on a btrfs subvolume is matched" "$(( $(counter allowed) - b ))" 1
+        "$GUARD" --unload
+    else
+        skp "an allowed binary on btrfs is matched" "$LOOP_ERROR"
+    fi
+    umount "$LOOPMNT" 2>/dev/null; LOOPMNT=""
+fi
+
+echo
+echo "== reloading follows the binary to its new inode =="
+MOVING="$(probe moving/probe)"
+printf '%s\n' "$MOVING" > "$WORK/allow.conf"
+"$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
+old_ino="$(stat -c %i "$MOVING")"
+# Replacing rather than editing, which is what a package upgrade does.
+rm "$MOVING"; cp /usr/bin/unshare "$MOVING"; chmod 755 "$MOVING"
+[[ "$(stat -c %i "$MOVING")" != "$old_ino" ]] || no "the replacement really has a new inode"
+b="$(counter allowed)"
+makes_ns "$MOVING"
+is "before the reload the replaced binary no longer matches" "$(( $(counter allowed) - b ))" 0
+"$GUARD" --reload --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
+b="$(counter allowed)"
+makes_ns "$MOVING"
+is "after the reload it matches again" "$(( $(counter allowed) - b ))" 1
+"$GUARD" --unload
+
+echo
+echo "== enforcing =="
+if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} && ${DITANA_USERNS_TEST_ENFORCE:-} != yes ]]; then
+    skp "enforcing tests" "a graphical session is present; set DITANA_USERNS_TEST_ENFORCE=yes to run them anyway"
+else
+    ALLOWED="$(probe e-allowed/probe)"
+    DENIED="$(probe e-denied/probe)"
+    printf '%s\n' "$ALLOWED" > "$WORK/allow.conf"
+    "$GUARD" --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null || no "attach"
+    makes_ns "$ALLOWED" && ok "an allowed binary may create a user namespace" \
+                       || no "an allowed binary may create a user namespace"
+    makes_ns "$DENIED"  && no "an unlisted binary is refused" \
+                       || ok "an unlisted binary is refused"
+    # Root keeps CAP_SYS_ADMIN and could create the namespace regardless of this
+    # program, so refusing it would break container tooling for nothing.
+    "$DENIED" --user /bin/true >/dev/null 2>&1 && ok "root is not refused" || no "root is not refused"
+    "$GUARD" --unload
+fi
+
+echo
+echo "== an allowed binary must not become a door to unlimited namespaces =="
+# The first version short-circuited on CAP_SYS_ADMIN alone. Inside any user
+# namespace every task carries the full capability set relative to that
+# namespace, and create_user_ns() calls the hook before it installs the new
+# namespace on the credentials - so the hook saw a caller whose caps were
+# already full. Any user could run the one allowed binary, ask it for a
+# namespace, and from inside it create as many more as they liked with any
+# program. The guard only checks capabilities when the caller is in the initial
+# user namespace, and this is what that buys.
+if [[ -n ${DISPLAY:-}${WAYLAND_DISPLAY:-} && ${DITANA_USERNS_TEST_ENFORCE:-} != yes ]]; then
+    skp "nesting out of an allowed binary is refused" "a graphical session is present"
+else
+    OUTER="$(probe nest/outer)"
+    INNER="$(probe nest/inner)"
+    printf '%s\n' "$OUTER" > "$WORK/allow.conf"
+    "$GUARD" --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null || no "attach"
+    as_user "$OUTER" --user /bin/true >/dev/null 2>&1 \
+        && ok "the allowed binary still gets its own namespace" \
+        || no "the allowed binary still gets its own namespace"
+    # The inner unshare runs inside the outer namespace, where the old version
+    # would have waved it through on capabilities alone.
+    as_user "$OUTER" --user "$INNER" --user /bin/true >/dev/null 2>&1 \
+        && no "a different binary nesting inside it is refused" \
+        || ok "a different binary nesting inside it is refused"
+    "$GUARD" --unload
+fi
+
+echo
+echo "== an inode number that collides across btrfs subvolumes is not a match =="
+# btrfs gives every subvolume its own inode-number space but one superblock, so
+# the (device, inode) pair the kernel sees is not unique within one filesystem -
+# which is exactly why btrfs reports a made-up per-subvolume device to user
+# space. An unprivileged user may create a subvolume, so they control the inode
+# numbers in it. The owner is the third component of the key for this reason and
+# no other.
+if ! command -v mkfs.btrfs >/dev/null; then
+    skp "a colliding inode in another subvolume is refused" "btrfs-progs is not installed"
+else
+    LOOPMNT="$WORK/btrfs2"; mkdir -p "$LOOPMNT"
+    if loop_btrfs "$WORK/btrfs2.img" "$LOOPMNT"; then
+        btrfs subvolume create "$LOOPMNT/allowed" >/dev/null
+        btrfs subvolume create "$LOOPMNT/forged"  >/dev/null
+        chown "$USER_NAME" "$LOOPMNT/forged"
+        # The first file in a fresh subvolume gets inode 257 in both of them.
+        cp /usr/bin/unshare "$LOOPMNT/allowed/probe"; chmod 755 "$LOOPMNT/allowed/probe"
+        as_user cp /usr/bin/unshare "$LOOPMNT/forged/probe"; chmod 755 "$LOOPMNT/forged/probe"
+        a_ino="$(stat -c %i "$LOOPMNT/allowed/probe")"
+        f_ino="$(stat -c %i "$LOOPMNT/forged/probe")"
+        is "the two subvolumes really produce the same inode number" "$f_ino" "$a_ino"
+
+        printf '%s\n' "$LOOPMNT/allowed/probe" > "$WORK/allow.conf"
+        "$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
+        b="$(counter allowed)"
+        makes_ns "$LOOPMNT/forged/probe"
+        is "the forged copy is not matched" "$(( $(counter allowed) - b ))" 0
+        b="$(counter allowed)"
+        makes_ns "$LOOPMNT/allowed/probe"
+        is "while the real one still is" "$(( $(counter allowed) - b ))" 1
+        "$GUARD" --unload
+    else
+        skp "a colliding inode in another subvolume is refused" "$LOOP_ERROR"
+    fi
+    umount "$LOOPMNT" 2>/dev/null; LOOPMNT=""
+fi
+
+echo
+echo "== the loader refuses to allow a file somebody else can replace =="
+# The owner is load-bearing, so a list naming a file that is not root-owned is a
+# list whose keys an unprivileged user can reproduce.
+NOTROOT="$(probe notroot/probe)"
+chown "$USER_NAME" "$NOTROOT"
+printf '%s\n' "$NOTROOT" > "$WORK/allow.conf"
+"$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null 2>&1 \
+    && no "a file not owned by root is refused" || ok "a file not owned by root is refused"
+"$GUARD" --unload
+
+echo
+echo "== a reload with no guard loaded is silent and succeeds =="
+"$GUARD" --reload >/dev/null 2>&1 && ok "--reload does nothing when nothing is attached" \
+                                  || no "--reload does nothing when nothing is attached"
+
+echo
+echo "--- $pass passed, $fail failed, $skip skipped"
+[[ $fail -eq 0 ]]
