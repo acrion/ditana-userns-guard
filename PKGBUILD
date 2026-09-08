@@ -9,12 +9,12 @@ url="https://github.com/acrion/ditana-userns-guard"
 license=('AGPL-3.0-or-later AND GPL-2.0-or-later')
 depends=(libbpf systemd procps-ng)
 makedepends=(clang llvm linux-api-headers)
-source=("file://${PWD}/Makefile"
-        "file://${PWD}/userns_guard.bpf.c"
-        "file://${PWD}/kernel_types.h"
-        "file://${PWD}/userns-guard.c"
-        "file://${PWD}/systemd/ditana-userns-guard.service"
-        "file://${PWD}/hooks/90-ditana-userns-guard.hook")
+source=(Makefile
+        userns_guard.bpf.c
+        kernel_types.h
+        userns-guard.c
+        systemd/ditana-userns-guard.service
+        hooks/90-ditana-userns-guard.hook)
 sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 # The BPF object carries no reference to the kernel it was built against:

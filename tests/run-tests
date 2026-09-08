@@ -23,8 +23,16 @@ no()   { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
 skp()  { printf '  skip %s (%s)\n' "$1" "$2"; skip=$((skip+1)); }
 is()   { if [[ "$2" == "$3" ]]; then ok "$1"; else no "$1: expected '$3', got '$2'"; fi }
 
+BTRFS_DIR=""
+BTRFS_SCRATCH=""
 cleanup() {
     "$GUARD" --unload >/dev/null 2>&1
+    if [[ -n $BTRFS_SCRATCH ]]; then
+        for sub in "$BTRFS_SCRATCH"/*; do
+            [[ -d $sub ]] && btrfs subvolume delete "$sub" >/dev/null 2>&1
+        done
+        rmdir "$BTRFS_SCRATCH" 2>/dev/null
+    fi
     [[ -n $LOOPMNT ]] && umount "$LOOPMNT" 2>/dev/null
     [[ -n $SYSCTL_BEFORE ]] && sysctl -q -w "kernel.unprivileged_userns_clone=$SYSCTL_BEFORE"
     rm -rf "$WORK"
@@ -50,6 +58,16 @@ counter()  { "$GUARD" --status | awk -v k="$1" '$1==k{print $2}'; }
 # failed once on a machine that had btrfs-progs and a btrfs filesystem, and the
 # reason was thrown away with 2>/dev/null.
 LOOP_ERROR=""
+
+# Returns the directory to put the subvolumes in, and sets LOOPMNT when it
+# mounted something that has to come down again.
+#
+# A loop-mounted image is preferred because it touches nothing outside the
+# scratch directory. Where that is not available - the loop module is not always
+# loadable, and CONFIG_BLK_DEV_LOOP_MIN_COUNT=0 means there is no /dev/loopN to
+# fall back on - DITANA_USERNS_TEST_BTRFS may name a btrfs filesystem to use
+# instead. It has to be named rather than discovered: a test suite that goes
+# looking for a filesystem to write to is a surprise nobody asked for.
 loop_btrfs() {
     local img="$1" mnt="$2" out
     truncate -s 300M "$img"
@@ -57,11 +75,29 @@ loop_btrfs() {
         LOOP_ERROR="mkfs.btrfs: ${out//$'\n'/ }"
         return 1
     fi
-    if ! out=$(mount -o loop "$img" "$mnt" 2>&1); then
-        LOOP_ERROR="mount: ${out//$'\n'/ }"
-        return 1
+    modprobe -q loop 2>/dev/null
+    if out=$(mount -o loop "$img" "$mnt" 2>&1); then
+        BTRFS_DIR="$mnt"
+        LOOPMNT="$mnt"
+        return 0
     fi
-    return 0
+    LOOP_ERROR="mount: ${out//$'\n'/ }"
+
+    if [[ -n ${DITANA_USERNS_TEST_BTRFS:-} ]]; then
+        if [[ "$(findmnt -no FSTYPE --target "$DITANA_USERNS_TEST_BTRFS" 2>/dev/null)" != btrfs ]]; then
+            LOOP_ERROR="$LOOP_ERROR; DITANA_USERNS_TEST_BTRFS=$DITANA_USERNS_TEST_BTRFS is not on btrfs"
+            return 1
+        fi
+        BTRFS_DIR="$(mktemp -d "$DITANA_USERNS_TEST_BTRFS/ditana-userns-test.XXXXXX")"
+        # mktemp gives 700, and the forged half of the collision test is written
+        # by the unprivileged user, who has to be able to walk in here first.
+        chmod 755 "$BTRFS_DIR"
+        BTRFS_SCRATCH="$BTRFS_DIR"
+        LOOPMNT=""
+        return 0
+    fi
+    LOOP_ERROR="$LOOP_ERROR; set DITANA_USERNS_TEST_BTRFS to a path on a btrfs filesystem to run this anyway"
+    return 1
 }
 
 echo "== observing: the allowlist decides, nothing is refused =="
@@ -89,21 +125,27 @@ echo "== the device number must come from the kernel, not from stat() =="
 if ! command -v mkfs.btrfs >/dev/null; then
     skp "an allowed binary on btrfs is matched" "btrfs-progs is not installed"
 else
-    LOOPMNT="$WORK/btrfs"; mkdir -p "$LOOPMNT"
-    if loop_btrfs "$WORK/btrfs.img" "$LOOPMNT"; then
+    mkdir -p "$WORK/btrfs"
+    if loop_btrfs "$WORK/btrfs.img" "$WORK/btrfs"; then
         # A subvolume, because that is where the two device numbers part ways.
-        btrfs subvolume create "$LOOPMNT/sub" >/dev/null
-        cp /usr/bin/unshare "$LOOPMNT/sub/probe"; chmod 755 "$LOOPMNT/sub/probe"
-        printf '%s\n' "$LOOPMNT/sub/probe" > "$WORK/allow.conf"
+        btrfs subvolume create "$BTRFS_DIR/sub" >/dev/null
+        cp /usr/bin/unshare "$BTRFS_DIR/sub/probe"; chmod 755 "$BTRFS_DIR/sub/probe"
+        printf '%s\n' "$BTRFS_DIR/sub/probe" > "$WORK/allow.conf"
         "$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
         b="$(counter allowed)"
-        makes_ns "$LOOPMNT/sub/probe"
+        makes_ns "$BTRFS_DIR/sub/probe"
         is "an allowed binary on a btrfs subvolume is matched" "$(( $(counter allowed) - b ))" 1
         "$GUARD" --unload
     else
         skp "an allowed binary on btrfs is matched" "$LOOP_ERROR"
     fi
-    umount "$LOOPMNT" 2>/dev/null; LOOPMNT=""
+    [[ -n $LOOPMNT ]] && umount "$LOOPMNT" 2>/dev/null; LOOPMNT=""
+    if [[ -n $BTRFS_SCRATCH ]]; then
+        for sub in "$BTRFS_SCRATCH"/*; do
+            [[ -d $sub ]] && btrfs subvolume delete "$sub" >/dev/null 2>&1
+        done
+        rmdir "$BTRFS_SCRATCH" 2>/dev/null; BTRFS_SCRATCH=""
+    fi
 fi
 
 echo
@@ -182,31 +224,43 @@ echo "== an inode number that collides across btrfs subvolumes is not a match ==
 if ! command -v mkfs.btrfs >/dev/null; then
     skp "a colliding inode in another subvolume is refused" "btrfs-progs is not installed"
 else
-    LOOPMNT="$WORK/btrfs2"; mkdir -p "$LOOPMNT"
-    if loop_btrfs "$WORK/btrfs2.img" "$LOOPMNT"; then
-        btrfs subvolume create "$LOOPMNT/allowed" >/dev/null
-        btrfs subvolume create "$LOOPMNT/forged"  >/dev/null
-        chown "$USER_NAME" "$LOOPMNT/forged"
+    mkdir -p "$WORK/btrfs2"
+    a_ino=""; f_ino=""; SETUP_ERROR="$LOOP_ERROR"
+    if loop_btrfs "$WORK/btrfs2.img" "$WORK/btrfs2"; then
+        SETUP_ERROR="the two subvolumes did not produce a colliding inode number"
+        btrfs subvolume create "$BTRFS_DIR/allowed" >/dev/null
+        btrfs subvolume create "$BTRFS_DIR/forged"  >/dev/null
+        chown "$USER_NAME" "$BTRFS_DIR/forged"
         # The first file in a fresh subvolume gets inode 257 in both of them.
-        cp /usr/bin/unshare "$LOOPMNT/allowed/probe"; chmod 755 "$LOOPMNT/allowed/probe"
-        as_user cp /usr/bin/unshare "$LOOPMNT/forged/probe"; chmod 755 "$LOOPMNT/forged/probe"
-        a_ino="$(stat -c %i "$LOOPMNT/allowed/probe")"
-        f_ino="$(stat -c %i "$LOOPMNT/forged/probe")"
+        cp /usr/bin/unshare "$BTRFS_DIR/allowed/probe"; chmod 755 "$BTRFS_DIR/allowed/probe"
+        as_user cp /usr/bin/unshare "$BTRFS_DIR/forged/probe"; chmod 755 "$BTRFS_DIR/forged/probe"
+        a_ino="$(stat -c %i "$BTRFS_DIR/allowed/probe" 2>/dev/null)"
+        f_ino="$(stat -c %i "$BTRFS_DIR/forged/probe" 2>/dev/null)"
         is "the two subvolumes really produce the same inode number" "$f_ino" "$a_ino"
-
-        printf '%s\n' "$LOOPMNT/allowed/probe" > "$WORK/allow.conf"
+    fi
+    # A forged copy that was never created makes no namespace, so the two
+    # assertions below would hold without anything having been tested. They only
+    # mean something once the collision has actually been built.
+    if [[ -n ${a_ino:-} && "$f_ino" == "$a_ino" ]]; then
+        printf '%s\n' "$BTRFS_DIR/allowed/probe" > "$WORK/allow.conf"
         "$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
         b="$(counter allowed)"
-        makes_ns "$LOOPMNT/forged/probe"
+        makes_ns "$BTRFS_DIR/forged/probe"
         is "the forged copy is not matched" "$(( $(counter allowed) - b ))" 0
         b="$(counter allowed)"
-        makes_ns "$LOOPMNT/allowed/probe"
+        makes_ns "$BTRFS_DIR/allowed/probe"
         is "while the real one still is" "$(( $(counter allowed) - b ))" 1
         "$GUARD" --unload
     else
-        skp "a colliding inode in another subvolume is refused" "$LOOP_ERROR"
+        skp "a colliding inode in another subvolume is refused" "${SETUP_ERROR:-$LOOP_ERROR}"
     fi
-    umount "$LOOPMNT" 2>/dev/null; LOOPMNT=""
+    [[ -n $LOOPMNT ]] && umount "$LOOPMNT" 2>/dev/null; LOOPMNT=""
+    if [[ -n $BTRFS_SCRATCH ]]; then
+        for sub in "$BTRFS_SCRATCH"/*; do
+            [[ -d $sub ]] && btrfs subvolume delete "$sub" >/dev/null 2>&1
+        done
+        rmdir "$BTRFS_SCRATCH" 2>/dev/null; BTRFS_SCRATCH=""
+    fi
 fi
 
 echo
