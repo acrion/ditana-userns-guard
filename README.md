@@ -4,9 +4,9 @@ Restricts unprivileged user namespaces to a declared list of executables, rather
 
 ## Why this exists
 
-Unprivileged user namespaces represent a recognized method to widen the kernel attack surface. Among the sixteen Linux kernel entries included by CISA in its Known Exploited Vulnerabilities catalogue over three years, six are exploitable through them. Ditana therefore ships with `kernel.unprivileged_userns_clone=0`.
+Unprivileged user namespaces represent a recognized method to widen the kernel attack surface. Among the sixteen Linux kernel entries included by CISA in its [Known Exploited Vulnerabilities catalogue](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) over three years, six are exploitable through them – as per catalogue version 2026.09.04, and which six is our own reading of it rather than a figure anybody published. Ditana therefore ships with `kernel.unprivileged_userns_clone=0`.
 
-Sandboxes rely on them, though. Flatpak and Bubblejail both rest upon bubblewrap, and bubblewrap creates a user namespace. Until 2026 the solution was a setuid `bwrap`, which does not need the sysctl to be raised. That option has vanished: bubblewrap 0.12.0 removed setuid support one day after 0.11.2 fixed CVE-2026-41163, a privilege escalation present solely in setuid mode. Arch dropped `bubblewrap-suid`, no replacement was written, and nobody maintains the 0.11.x branch that was offered at the time.
+Sandboxes rely on them, though. Flatpak and Bubblejail both rest upon bubblewrap, and bubblewrap creates a user namespace. Until 2026 the solution was a setuid `bwrap`, which does not need the sysctl to be raised. That option has vanished: bubblewrap 0.12.0 [removed setuid support](https://github.com/containers/bubblewrap/pull/742) one day after 0.11.2 fixed [CVE-2026-41163](https://nvd.nist.gov/vuln/detail/CVE-2026-41163), a privilege escalation present solely in setuid mode. Arch dropped `bubblewrap-suid`, no replacement was written, and nobody maintains the 0.11.x branch that was offered at the time.
 
 So the choice is no longer between a hardened kernel and working sandboxes. It is between switching user namespaces on for everything, and permitting them per executable. This program implements the second option.
 
