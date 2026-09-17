@@ -40,6 +40,7 @@ install: all
 	install -Dm644 $(HOOK) $(DESTDIR)$(PREFIX)/share/libalpm/hooks/90-ditana-userns-guard.hook
 
 check: all
+	tests/refusal-test
 	tests/run-tests
 
 clean:

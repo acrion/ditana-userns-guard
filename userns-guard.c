@@ -26,6 +26,8 @@
 #define MAP_SLOTS (2 * MAX_ALLOWED)
 #define MAX_PATH_LEN 4096
 #define LOCK_FILE "/run/ditana-userns-guard.lock"
+#define ATTACHED_OBJECT "/run/ditana-userns-guard.object"
+#define IDENTITY_LEN 128
 
 struct exe_key {
 	unsigned int dev;
@@ -274,6 +276,64 @@ static int pins_exist(void)
 	return stat(PIN_LINK, &st) == 0;
 }
 
+/* Attaching happens once, at boot. A reload later intentionally leaves the
+ * running program alone and only refreshes the maps, so an upgrade that ships a
+ * modified program -- such as a fix -- reaches the kernel no earlier than the
+ * next restart of the unit. Nothing said so. What the three functions below add
+ * is the sentence: the identity of the object that was attached is recorded
+ * beside the lock, and every reload compares it with the object on disk.
+ */
+static int object_identity(const char *object, char *out, size_t len)
+{
+	struct stat st;
+
+	if (stat(object, &st) != 0)
+		return -1;
+	snprintf(out, len, "%llu:%llu:%lld:%lld\n",
+		 (unsigned long long)st.st_dev, (unsigned long long)st.st_ino,
+		 (long long)st.st_size, (long long)st.st_mtim.tv_sec);
+	return 0;
+}
+
+static void record_object(const char *object)
+{
+	char identity[IDENTITY_LEN];
+	FILE *f;
+
+	if (object_identity(object, identity, sizeof(identity)) != 0)
+		return;
+	f = fopen(ATTACHED_OBJECT, "we");
+	if (!f) {
+		complain(ATTACHED_OBJECT, errno);
+		return;
+	}
+	fputs(identity, f);
+	fclose(f);
+}
+
+/* 1 when the object on disk is the one that is attached, 0 when it is not, and
+ * -1 when there is nothing to compare: a machine that attached under an older
+ * version of this loader has no record, and silence is better there than a
+ * warning nobody can act on.
+ */
+static int object_is_attached(const char *object)
+{
+	char identity[IDENTITY_LEN], recorded[IDENTITY_LEN];
+	FILE *f;
+
+	if (object_identity(object, identity, sizeof(identity)) != 0)
+		return -1;
+	f = fopen(ATTACHED_OBJECT, "re");
+	if (!f)
+		return -1;
+	if (!fgets(recorded, sizeof(recorded), f)) {
+		fclose(f);
+		return -1;
+	}
+	fclose(f);
+	return strcmp(identity, recorded) == 0;
+}
+
 /* bpf_map__reuse_fd takes the pinned map's shape over the one just compiled,
  * without comparing them. A loader whose key or capacity changed would then
  * quietly go on writing into the map an older version left pinned, and the two
@@ -353,6 +413,18 @@ static int run(const char *object, const char *allowlist, int enforce, int reloa
 		close(lock_fd);
 		return 0;
 	}
+
+	/* Said on every reload rather than once, because the pacman hook is the
+	 * only thing that runs after an upgrade, and a machine that updates
+	 * unattended has nobody reading the one message a package transaction
+	 * would have shown. The reload itself carries on: the allowlist has to
+	 * follow the binaries whatever program is enforcing it.
+	 */
+	if (attached && object_is_attached(object) == 0)
+		fprintf(stderr, "ditana-userns-guard: %s has changed since the guard was attached, "
+				"and the program in the kernel is still the previous one. "
+				"Restart the service to put the installed program in charge: "
+				"systemctl restart ditana-userns-guard.service\n", object);
 
 	/* A path that has gone missing is drift at load time and an ordinary
 	 * package removal at reload time. See read_allowlist.
@@ -474,6 +546,8 @@ static int run(const char *object, const char *allowlist, int enforce, int reloa
 		goto out;
 	}
 
+	record_object(object);
+
 	printf("ditana-userns-guard: %s, %d executable(s) allowed\n",
 	       enforce ? "enforcing" : "observing", count);
 	rc = 0;
@@ -488,6 +562,7 @@ out:
 
 static int do_unload(void)
 {
+	unlink(ATTACHED_OBJECT);
 	unlink(PIN_LINK);
 	unlink(PIN_ALLOW);
 	unlink(PIN_LEARN);
@@ -517,6 +592,18 @@ static int do_status(void)
 	if (fd >= 0) {
 		printf("%-8s %d\n", "allowlist", map_count(fd));
 		close(fd);
+	}
+
+	switch (object_is_attached(OBJECT)) {
+	case 1:
+		printf("%-8s %s\n", "program", "current");
+		break;
+	case 0:
+		printf("%-8s %s\n", "program", "installed one not attached, restart the service");
+		break;
+	default:
+		printf("%-8s %s\n", "program", "unknown");
+		break;
 	}
 	return 0;
 }

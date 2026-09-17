@@ -13,6 +13,25 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 GUARD="$ROOT/build/ditana-userns-guard"
 OBJECT="$ROOT/build/userns_guard.bpf.o"
+
+# The cases below drive the loader, and the loader knows one pin directory. On a
+# machine where the guard is in service they would therefore work on the pins
+# that are in force: the first case reloads into them, replaces the allowlist
+# with a probe and switches enforcement off, and every --unload here takes the
+# link pin with it. What is left behind is a machine on which any program may
+# create a user namespace while the unit still reports success - the one outcome
+# the guard exists to prevent, produced by its own tests. So the suite refuses,
+# and says how to make the machine ready for it. The path is a variable because
+# the refusal is itself tested, by tests/refusal-test.
+PIN_LINK="${DITANA_USERNS_TEST_PIN_LINK:-/sys/fs/bpf/ditana-userns-guard/link}"
+if [[ -e $PIN_LINK ]]; then
+    echo "REFUSED: a guard is attached ($PIN_LINK)."
+    echo "  These tests share its pin directory: they would take over its maps, replace"
+    echo "  its allowlist, switch enforcement off and unload it when they are done."
+    echo "  Stop it first: systemctl stop ditana-userns-guard.service"
+    exit 1
+fi
+
 WORK="$(mktemp -d)"
 SYSCTL_BEFORE=""
 LOOPMNT=""
@@ -164,6 +183,32 @@ is "before the reload the replaced binary no longer matches" "$(( $(counter allo
 b="$(counter allowed)"
 makes_ns "$MOVING"
 is "after the reload it matches again" "$(( $(counter allowed) - b ))" 1
+"$GUARD" --unload
+
+echo
+echo "== a reload says when the installed program is not the one in the kernel =="
+# A reload refreshes the maps and leaves the attached program in place, so an
+# upgrade delivering a changed program reaches the kernel no earlier than the
+# next restart of the unit. That is deliberate -- reattaching while the machine
+# is running is a decision of its own -- but prior to this message, nothing said
+# it, and a machine that updates unattended would have carried the old program
+# for weeks while every transaction reported a successful reload.
+COPY="$WORK/other.bpf.o"
+cp "$OBJECT" "$COPY"
+SAME="$(probe same/probe)"
+printf '%s\n' "$SAME" > "$WORK/allow.conf"
+"$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null
+out="$("$GUARD" --reload --object "$OBJECT" --allowlist "$WORK/allow.conf" 2>&1)"
+[[ $out != *"has changed since the guard was attached"* ]] \
+    && ok "a reload with the attached object stays quiet" \
+    || no "a reload with the attached object stays quiet"
+out="$("$GUARD" --reload --object "$COPY" --allowlist "$WORK/allow.conf" 2>&1)"
+[[ $out == *"has changed since the guard was attached"* ]] \
+    && ok "a reload with a different object names the restart" \
+    || no "a reload with a different object names the restart"
+"$GUARD" --status | grep -q '^program ' \
+    && ok "--status reports the program as well" \
+    || no "--status reports the program as well"
 "$GUARD" --unload
 
 echo

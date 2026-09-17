@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# The control suite for the one case tests/run-tests must get right before it
+# has run anything: a guard that is in service on this machine. Its own cases
+# cannot cover that, because arriving at the situation means attaching a guard
+# outside the suite, which is exactly what must not happen here. So the pin path
+# is a variable in run-tests, and this suite assigns it to a harmless location.
+#
+# It needs no root and attaches nothing.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SUITE="$ROOT/tests/run-tests"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+pass=0; fail=0; skip=0
+ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+skp() { printf '  skip %s (%s)\n' "$1" "$2"; skip=$((skip+1)); }
+
+echo "== the suite refuses to run beside a guard that is in service =="
+: > "$WORK/link"
+out="$(DITANA_USERNS_TEST_PIN_LINK="$WORK/link" "$SUITE" 2>&1)"
+status=$?
+
+[[ $status -eq 1 ]] && ok "it fails" || no "it fails: expected 1, got $status"
+[[ $out == *"$WORK/link"* ]] && ok "it names the pin" || no "it names the pin"
+[[ $out == *"systemctl stop ditana-userns-guard.service"* ]] \
+    && ok "it says how to make the machine ready" \
+    || no "it says how to make the machine ready"
+# A suite that refused after loading would already have caused the damage
+# the refusal exists to prevent, and the counters would be the evidence.
+[[ $out != *"executable(s) allowed"* ]] && ok "it refuses before it attaches anything" \
+                                        || no "it refuses before it attaches anything"
+
+echo
+echo "== without such a pin it goes on =="
+if [[ $EUID -eq 0 ]]; then
+    # As root it would not stop at the refusal but run the whole suite, which is
+    # what "make check" is for, not this one.
+    skp "it does not refuse when no guard is attached" "would run the full suite as root"
+else
+    out="$(DITANA_USERNS_TEST_PIN_LINK="$WORK/absent" "$SUITE" 2>&1)"
+    [[ $out != *REFUSED* ]] && ok "it does not refuse when no guard is attached" \
+                            || no "it does not refuse when no guard is attached"
+fi
+
+echo
+echo "--- $pass passed, $fail failed, $skip skipped"
+[[ $fail -eq 0 ]]

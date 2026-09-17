@@ -54,6 +54,8 @@ Because the match is by inode, replacing one of the listed binaries makes the ru
 
 A binary inside a Flatpak would not be covered by that hook, since `flatpak update` is not a pacman transaction. This is one of the reasons Ditana still installs Chromium-based browsers as native packages rather than as Flatpaks.
 
+What a reload does *not* do is exchange the program in the kernel. It refreshes the maps the attached program reads and leaves that program alone, so an upgrade of this package – a fix among them – becomes active at the next start of the unit and not earlier. That is deliberate: reattaching while the machine is running is a decision of its own, not something a package transaction should casually include. It is also easy to overlook on a machine that updates unattended, which is why the loader now records which object it attached and every reload compares: when the installed object differs from the attached one, the reload announces it and names `systemctl restart ditana-userns-guard.service`. `ditana-userns-guard --status` reports the same under `program`.
+
 ## Usage
 
 ```
@@ -74,6 +76,8 @@ sudo make check
 ```
 
 The tests need root, because attaching a BPF LSM program does. They create a loop-mounted btrfs filesystem to cover the device-number scenario mentioned above, and they skip that scenario when `btrfs-progs` is absent. The enforcing tests deny unprivileged user namespaces machine-wide for as long as they run, so they refuse to start where a graphical session is present unless `DITANA_USERNS_TEST_ENFORCE=yes` says the machine is expendable.
+
+There is one machine the tests will not run on at all: one where the guard is in service. They share its pin directory, so they would take its maps over, replace its allowlist with a probe, switch enforcement off, and unload it when they are done – leaving a machine on which any program may create a user namespace while the unit still reports success. The suite therefore stops at the pin and says so. `systemctl stop ditana-userns-guard.service` makes the machine ready for it, and `tests/refusal-test`, which needs no root, covers that refusal.
 
 ## Requirements
 
