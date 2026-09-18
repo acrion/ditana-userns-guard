@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PIN_DIR    "/sys/fs/bpf/ditana-userns-guard"
@@ -18,6 +19,7 @@
 #define PIN_LEARN  PIN_DIR "/userns_learn"
 #define PIN_TGID   PIN_DIR "/userns_learn_tgid"
 #define PIN_STATE  PIN_DIR "/userns_state"
+#define PIN_REFUSED PIN_DIR "/userns_refused"
 
 #define OBJECT     "/usr/lib/ditana/userns_guard.bpf.o"
 #define ALLOWLIST  "/etc/ditana/userns-allow.conf"
@@ -36,6 +38,24 @@ struct exe_key {
 };
 
 enum { STATE_ENFORCE = 0, STATE_DENIED = 1, STATE_ALLOWED = 2 };
+
+/* Must match the definitions in userns_guard.bpf.c. */
+#define REFUSED_SLOTS 64
+#define REFUSED_NAME_LEN 64
+#define TASK_COMM_LEN 16
+
+struct refused_key {
+	unsigned long long ino;
+	unsigned int dev;
+	unsigned int uid;
+};
+
+struct refused_value {
+	unsigned long long count;
+	unsigned long long last_ns;
+	char name[REFUSED_NAME_LEN];
+	char comm[TASK_COMM_LEN];
+};
 
 static int be_quiet(enum libbpf_print_level level, const char *fmt, va_list ap)
 {
@@ -378,7 +398,7 @@ static int run(const char *object, const char *allowlist, int enforce, int reloa
 	static char paths[MAX_ALLOWED][MAX_PATH_LEN];
 	struct bpf_object *obj = NULL;
 	struct bpf_program *guard, *learner;
-	struct bpf_map *allow_map, *learn_map, *tgid_map, *state_map;
+	struct bpf_map *allow_map, *learn_map, *tgid_map, *state_map, *refused_map;
 	struct bpf_link *learn_link = NULL;
 	struct bpf_link *guard_link = NULL;
 	int attached;
@@ -444,7 +464,9 @@ static int run(const char *object, const char *allowlist, int enforce, int reloa
 	learn_map = bpf_object__find_map_by_name(obj, "userns_learn");
 	tgid_map = bpf_object__find_map_by_name(obj, "userns_learn_tgid");
 	state_map = bpf_object__find_map_by_name(obj, "userns_state");
-	if (!guard || !learner || !allow_map || !learn_map || !tgid_map || !state_map) {
+	refused_map = bpf_object__find_map_by_name(obj, "userns_refused");
+	if (!guard || !learner || !allow_map || !learn_map || !tgid_map || !state_map ||
+	    !refused_map) {
 		fprintf(stderr, "ditana-userns-guard: the object is missing a map or a program\n");
 		goto out;
 	}
@@ -530,6 +552,8 @@ static int run(const char *object, const char *allowlist, int enforce, int reloa
 		err = bpf_map__pin(tgid_map, PIN_TGID);
 	if (!err)
 		err = bpf_map__pin(state_map, PIN_STATE);
+	if (!err)
+		err = bpf_map__pin(refused_map, PIN_REFUSED);
 	if (err) {
 		/* Half a pin set is worse than none: the next start would take the
 		 * link for granted and reload into maps the guard is not reading.
@@ -542,6 +566,7 @@ static int run(const char *object, const char *allowlist, int enforce, int reloa
 		unlink(PIN_LEARN);
 		unlink(PIN_TGID);
 		unlink(PIN_STATE);
+		unlink(PIN_REFUSED);
 		rmdir(PIN_DIR);
 		goto out;
 	}
@@ -568,8 +593,81 @@ static int do_unload(void)
 	unlink(PIN_LEARN);
 	unlink(PIN_TGID);
 	unlink(PIN_STATE);
+	unlink(PIN_REFUSED);
 	rmdir(PIN_DIR);
 	return 0;
+}
+
+struct refusal {
+	struct refused_key key;
+	struct refused_value value;
+};
+
+static int most_recent_first(const void *a, const void *b)
+{
+	const struct refusal *x = a, *y = b;
+
+	return x->value.last_ns < y->value.last_ns ? 1 : x->value.last_ns > y->value.last_ns ? -1 : 0;
+}
+
+static void format_age(unsigned long long seconds, char *out, size_t len)
+{
+	if (seconds < 120)
+		snprintf(out, len, "%llu s", seconds);
+	else if (seconds < 120 * 60)
+		snprintf(out, len, "%llu min", seconds / 60);
+	else if (seconds < 48 * 3600)
+		snprintf(out, len, "%llu h", seconds / 3600);
+	else
+		snprintf(out, len, "%llu d", seconds / 86400);
+}
+
+/* A guard attached by an older version has no such map, and neither has a
+ * guard whose program predates it and was only reloaded since. Both are
+ * simply omitted: "program" above already says when a restart is due.
+ */
+static void print_refused(void)
+{
+	static struct refusal all[REFUSED_SLOTS];
+	struct refused_key key, next;
+	struct timespec now;
+	unsigned long long now_ns, age;
+	char when[32];
+	int fd, n = 0;
+
+	fd = bpf_obj_get(PIN_REFUSED);
+	if (fd < 0)
+		return;
+	clock_gettime(CLOCK_BOOTTIME, &now);
+	now_ns = (unsigned long long)now.tv_sec * 1000000000ULL + now.tv_nsec;
+
+	if (bpf_map_get_next_key(fd, NULL, &key) == 0) {
+		for (;;) {
+			if (n < REFUSED_SLOTS &&
+			    bpf_map_lookup_elem(fd, &key, &all[n].value) == 0) {
+				all[n].key = key;
+				n++;
+			}
+			if (bpf_map_get_next_key(fd, &key, &next) != 0)
+				break;
+			key = next;
+		}
+	}
+	close(fd);
+
+	qsort(all, n, sizeof(all[0]), most_recent_first);
+	for (int i = 0; i < n; i++) {
+		struct refused_value *v = &all[i].value;
+
+		v->name[REFUSED_NAME_LEN - 1] = '\0';
+		v->comm[TASK_COMM_LEN - 1] = '\0';
+		age = now_ns > v->last_ns ? (now_ns - v->last_ns) / 1000000000ULL : 0;
+		format_age(age, when, sizeof(when));
+		printf("%-8s %llux uid %u %s", "refused", v->count, all[i].key.uid, v->name);
+		if (strcmp(v->name, v->comm) != 0)
+			printf(" (%s)", v->comm);
+		printf(", %s ago\n", when);
+	}
 }
 
 static int do_status(void)
@@ -578,10 +676,21 @@ static int do_status(void)
 	unsigned long long value;
 	int fd;
 
+	/* The pins live on bpffs, which systemd mounts for root alone. Without root
+	 * the lookup fails whether or not the guard is attached, so only ENOENT
+	 * means "not loaded". The person most likely to ask is one whose program
+	 * was just refused a namespace, and answering "not loaded" would rule out
+	 * the very thing that refused it.
+	 */
 	fd = bpf_obj_get(PIN_STATE);
-	if (fd < 0) {
+	if (fd == -ENOENT) {
 		printf("not loaded\n");
 		return 1;
+	}
+	if (fd < 0) {
+		fprintf(stderr, "ditana-userns-guard: cannot tell whether the guard is loaded "
+			"without root (%s)\n", strerror(-fd));
+		return 3;
 	}
 	for (unsigned int i = 0; i < 3; i++)
 		if (bpf_map_lookup_elem(fd, &i, &value) == 0)
@@ -605,6 +714,8 @@ static int do_status(void)
 		printf("%-8s %s\n", "program", "unknown");
 		break;
 	}
+
+	print_refused();
 	return 0;
 }
 

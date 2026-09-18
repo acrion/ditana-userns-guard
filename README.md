@@ -63,10 +63,14 @@ ditana-userns-guard                 # load and attach, or reload if already atta
 ditana-userns-guard --observe       # attach without refusing anything, and count
 ditana-userns-guard --reload        # refresh the list; silent no-op if not attached
 ditana-userns-guard --unload        # detach
-ditana-userns-guard --status        # enforcing or not, and the two counters
+ditana-userns-guard --status        # enforcing or not, the counters, and what was refused
 ```
 
 Observation mode is what makes the guard measurable on a machine whose sandboxes have to keep running: it counts what it would have refused instead of refusing it.
+
+All of these need root, `--status` included. systemd mounts bpffs for root alone, so without root the pins cannot be seen, whether the guard is attached or not. `--status` therefore answers `not loaded` and exits 1 only when it has looked and found nothing; without root it says that it cannot tell and exits 3.
+
+The counters indicate frequency; the lines beneath them say what, and whose. For every executable and user that was refused, `--status` names the file, and the name the task assigned to itself where that differs, how often, and how long ago. The most recent entries appear first, and the last 64 are kept. In observation mode, they are the ones that would have been refused. A guard attached by an older version has no such list until the service is restarted.
 
 ## Building and testing
 

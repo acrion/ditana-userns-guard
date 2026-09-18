@@ -57,11 +57,20 @@ struct inode {
 	struct super_block *i_sb;
 } preserve_access;
 
+struct qstr {
+	const unsigned char *name;
+} preserve_access;
+
+struct dentry {
+	struct qstr d_name;
+} preserve_access;
+
 struct path {
 	struct dentry *dentry;
 } preserve_access;
 
 struct file {
+	struct path f_path;
 	struct inode *f_inode;
 } preserve_access;
 

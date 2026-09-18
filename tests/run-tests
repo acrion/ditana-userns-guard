@@ -98,6 +98,14 @@ loop_btrfs() {
     if out=$(mount -o loop "$img" "$mnt" 2>&1); then
         BTRFS_DIR="$mnt"
         LOOPMNT="$mnt"
+        # The forged half of the collision case is written by the unprivileged
+        # user, and the mount is positioned beneath the scratch directory. mktemp
+        # gives that 700, and a root umask of 0027 causes all items created
+        # within it to be 750, so both must be opened for the user to walk in.
+        # setpriv still accesses the probes, yet only due to the exec occurring
+        # prior to the loss of its capabilities; the cp executed via as_user
+        # possesses none.
+        chmod 755 "$WORK" "$mnt"
         return 0
     fi
     LOOP_ERROR="mount: ${out//$'\n'/ }"
@@ -132,6 +140,28 @@ makes_ns "$DENIED"  && ok "an unlisted binary still runs while only observing" \
 is "the allowed one was counted as allowed" "$(( $(counter allowed) - before_a ))" 1
 is "the unlisted one was counted as denied" "$(( $(counter denied)  - before_d ))" 1
 "$GUARD" --unload
+
+echo
+echo "== --status names what was refused, and whose it was =="
+# The counters indicate frequency and not identity. Chromium reports a refused
+# namespace as a misconfigured setuid helper and never mentions the guard, so
+# this list is what points at it. Observing is enough: it records what it would
+# refuse.
+REFUSEE="$(probe refused/refusee)"
+LISTED="$(probe listed/listed-one)"
+printf '%s\n' "$LISTED" > "$WORK/allow.conf"
+"$GUARD" --observe --object "$OBJECT" --allowlist "$WORK/allow.conf" >/dev/null || no "attach"
+makes_ns "$REFUSEE"; makes_ns "$REFUSEE"; makes_ns "$LISTED"
+out="$("$GUARD" --status)"
+grep -qE "^refused +2x uid $(id -u "$USER_NAME") refusee, " <<<"$out" \
+    && ok "the refused binary is listed with its user and how often" \
+    || no "the refused binary is listed with its user and how often: $out"
+grep -q 'listed-one' <<<"$out" && no "an allowed binary is not listed" \
+                                || ok "an allowed binary is not listed"
+"$GUARD" --unload
+[[ ! -e /sys/fs/bpf/ditana-userns-guard/userns_refused ]] \
+    && ok "--unload takes the list's pin with it" \
+    || no "--unload takes the list's pin with it"
 
 echo
 echo "== the device number must come from the kernel, not from stat() =="
@@ -323,6 +353,15 @@ echo
 echo "== a reload with no guard loaded is silent and succeeds =="
 "$GUARD" --reload >/dev/null 2>&1 && ok "--reload does nothing when nothing is attached" \
                                   || no "--reload does nothing when nothing is attached"
+
+echo
+echo "== --status says \"not loaded\" only when it has looked =="
+# Only a missing pin means that nothing is attached. Everything else - a user
+# who cannot see bpffs among them - is covered by tests/unprivileged-test.
+out="$("$GUARD" --status 2>&1)"
+status=$?
+is "--status exits 1 when nothing is attached" "$status" 1
+is "--status says so" "$out" "not loaded"
 
 echo
 echo "--- $pass passed, $fail failed, $skip skipped"

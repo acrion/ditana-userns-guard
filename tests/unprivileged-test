@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# What the loader must get right for a user who is not root. It needs no root
+# and attaches nothing, so it runs wherever the source tree is built.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+GUARD="$ROOT/build/ditana-userns-guard"
+
+pass=0; fail=0; skip=0
+ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+skp() { printf '  skip %s (%s)\n' "$1" "$2"; skip=$((skip+1)); }
+
+[[ -x $GUARD ]] || { echo "FAIL: run 'make' first"; exit 1; }
+
+echo "== --status without root does not claim that nothing is loaded =="
+# systemd mounts bpffs for root alone, so a user cannot see the pins whether or
+# not the guard is attached. --status used to answer "not loaded" to that, on a
+# machine where the guard was enforcing and had just refused Discord its
+# namespace: the one diagnosis that ruled out the actual cause.
+if [[ $EUID -eq 0 ]]; then
+    skp "a user is told that root would know" "root can see the pins"
+elif [[ -x /sys/fs/bpf ]]; then
+    skp "a user is told that root would know" "bpffs is open to this user here"
+else
+    out="$("$GUARD" --status 2>&1)"
+    status=$?
+    [[ $status -eq 3 ]] && ok "it exits 3, not 1" || no "it exits 3, not 1: got $status"
+    [[ $out != *"not loaded"* ]] && ok "it does not say \"not loaded\"" \
+                                 || no "it does not say \"not loaded\""
+    [[ $out == *root* ]] && ok "it says that root would know" \
+                         || no "it says that root would know"
+fi
+
+echo
+echo "--- $pass passed, $fail failed, $skip skipped"
+[[ $fail -eq 0 ]]

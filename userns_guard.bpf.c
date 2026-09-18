@@ -98,6 +98,67 @@ static __always_inline void bump(__u32 slot)
 		__sync_fetch_and_add(cell, 1);
 }
 
+/* The counters say how frequently a namespace was refused, not to which
+ * entity, and that is not enough for the person whose program has just
+ * failed. Chromium, for one, reports a refused namespace as a misconfigured
+ * setuid helper and never names the guard. Thus, the refusals are also kept
+ * per executable and user, along with the file's name and the task's comm,
+ * and --status lists them.
+ *
+ * An LRU map, so that it keeps the most recent ones on its own and never
+ * fills up. In observation mode it records the same cases it counts as
+ * denied: the ones that would have been refused.
+ */
+#define REFUSED_SLOTS 64
+#define REFUSED_NAME_LEN 64
+#define TASK_COMM_LEN 16
+
+struct refused_key {
+	__u64 ino;
+	__u32 dev;
+	__u32 uid;
+};
+
+struct refused_value {
+	__u64 count;
+	__u64 last_ns;
+	char name[REFUSED_NAME_LEN];
+	char comm[TASK_COMM_LEN];
+};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, REFUSED_SLOTS);
+	__type(key, struct refused_key);
+	__type(value, struct refused_value);
+} userns_refused SEC(".maps");
+
+static __always_inline void remember_refusal(const struct exe_key *exe, struct file *exe_file)
+{
+	struct refused_key key = {};
+	struct refused_value fresh = {};
+	struct refused_value *seen;
+	const unsigned char *name;
+
+	key.ino = exe->ino;
+	key.dev = exe->dev;
+	key.uid = (__u32)bpf_get_current_uid_gid();
+
+	seen = bpf_map_lookup_elem(&userns_refused, &key);
+	if (seen) {
+		__sync_fetch_and_add(&seen->count, 1);
+		seen->last_ns = bpf_ktime_get_boot_ns();
+		return;
+	}
+
+	fresh.count = 1;
+	fresh.last_ns = bpf_ktime_get_boot_ns();
+	name = BPF_CORE_READ(exe_file, f_path.dentry, d_name.name);
+	bpf_probe_read_kernel_str(fresh.name, sizeof(fresh.name), name);
+	bpf_get_current_comm(fresh.comm, sizeof(fresh.comm));
+	bpf_map_update_elem(&userns_refused, &key, &fresh, BPF_ANY);
+}
+
 /* The owner is part of the identity, not decoration. On btrfs an inode number
  * is unique only within a subvolume while the superblock - and therefore
  * i_sb->s_dev - is shared by all of them, so two files in different subvolumes
@@ -147,6 +208,7 @@ int BPF_PROG(ditana_userns_create, const struct cred *cred, int prev)
 {
 	struct task_struct *task;
 	struct mm_struct *mm;
+	struct file *exe_file;
 	struct inode *inode;
 	struct exe_key key = {};
 	__u32 slot = STATE_ENFORCE;
@@ -188,7 +250,8 @@ int BPF_PROG(ditana_userns_create, const struct cred *cred, int prev)
 	if (!mm)
 		return 0; /* a kernel thread has no executable to match against */
 
-	inode = BPF_CORE_READ(mm, exe_file, f_inode);
+	exe_file = BPF_CORE_READ(mm, exe_file);
+	inode = BPF_CORE_READ(exe_file, f_inode);
 	if (!inode)
 		return 0;
 
@@ -200,6 +263,7 @@ int BPF_PROG(ditana_userns_create, const struct cred *cred, int prev)
 	}
 
 	bump(STATE_DENIED);
+	remember_refusal(&key, exe_file);
 
 	enforce = bpf_map_lookup_elem(&userns_state, &slot);
 	if (enforce && *enforce)
