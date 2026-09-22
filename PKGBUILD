@@ -1,7 +1,7 @@
 # Maintainer: Stefan Zipproth <s.zipproth@ditana.org>
 
 pkgname=ditana-userns-guard
-pkgver=1.01
+pkgver=1.02
 pkgrel=1
 pkgdesc="Restrict unprivileged user namespaces to executables that declared they need them"
 arch=(x86_64)

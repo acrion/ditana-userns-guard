@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# What `make install` has to put into the tree. It installs into a temporary
+# DESTDIR, so it needs no root and touches nothing outside it.
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+
+pass=0; fail=0
+ok()  { printf '  ok   %s\n' "$1"; pass=$((pass+1)); }
+no()  { printf '  FAIL %s\n' "$1"; fail=$((fail+1)); }
+
+DEST="$(mktemp -d)"
+trap 'rm -rf "$DEST"' EXIT
+
+if ! make -C "$ROOT" install DESTDIR="$DEST" >"$DEST/.log" 2>&1; then
+    echo "FAIL: make install failed"
+    cat "$DEST/.log"
+    exit 1
+fi
+
+echo "== the four installed paths =="
+for p in usr/bin/ditana-userns-guard \
+         usr/lib/ditana/userns_guard.bpf.o \
+         usr/lib/systemd/system/ditana-userns-guard.service \
+         usr/share/libalpm/hooks/90-ditana-userns-guard.hook; do
+    [[ -f "$DEST/$p" ]] && ok "$p" || no "$p is missing"
+done
+
+echo
+echo "== /etc/ditana =="
+# The machine that needs this directory is the one where nothing created it:
+# the installer writes /etc/ditana only where it also writes an allowlist, and
+# a machine whose sandboxes broke for want of one never got that far. In the
+# documented one-liner, tee then creates the file but not the directory above
+# it, and answers `tee: No such file or directory`.
+if [[ -d "$DEST/etc/ditana" ]]; then
+    ok "the directory is there"
+    mode="$(stat -c '%a' "$DEST/etc/ditana")"
+    [[ $mode == 755 ]] && ok "it is 755" || no "it is 755: got $mode"
+else
+    no "the directory is missing"
+fi
+
+# Empty on purpose. The unit carries ConditionPathExists on the allowlist, so
+# that file is the switch: shipping one would turn the guard on everywhere at
+# the next update, on machines that never asked for it.
+shipped="$(find "$DEST/etc/ditana" -mindepth 1 2>/dev/null)"
+[[ -z $shipped ]] && ok "no allowlist is shipped with it" \
+                  || no "no allowlist is shipped with it: found $shipped"
+
+echo
+echo "--- $pass passed, $fail failed"
+[[ $fail -eq 0 ]]

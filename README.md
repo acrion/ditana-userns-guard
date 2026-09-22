@@ -48,6 +48,8 @@ On Ditana the file is generated during installation. Each setting in `ditana-con
 
 The installer collects the declarations of the settings that are enabled and writes the file. Nothing in the configuration ever names the sysctl, and no setting has to repeat the safe default.
 
+Where no enabled setting requests a user namespace, the installer writes no list, and the directory that would hold it is not created either. That is why this package brings `/etc/ditana` along: the documented way to add an entry by hand ends in `| sudo tee /etc/ditana/userns-allow.conf`, and `tee` creates the file but never the directory above it.
+
 ## Keeping it current
 
 Because the match is by inode, replacing one of the listed binaries makes the running allowlist point at a file that no longer exists. Nothing would report it – the sandbox would simply stop being permitted. A pacman hook therefore reloads the list after every transaction. The reload is a handful of `open` calls, it adds the new entries before it removes the stale ones so that no sandbox launch falls into a gap, and it does nothing at all on a machine where the guard is not running.
