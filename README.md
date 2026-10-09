@@ -33,6 +33,10 @@ The sysctl therefore must be `1` for this to work, and the whole restriction liv
 
 systemd does not proceed to the second step if the first one failed. A machine that cannot build, load or attach the program keeps the sysctl it was installed with and stays exactly as locked as it was before – with sandboxes broken, but nothing exposed. Stopping the unit reverses the order for the same reason.
 
+## What it does not protect against
+
+The guard’s decision rests solely on the executable requesting a user namespace, and on no other factor. As `bwrap` no longer holds the setuid bit, any program can obtain a namespace equipped with the full capability set via it: either by using `bwrap --cap-add ALL`, or, with no option at all, when a library loaded through `LD_PRELOAD` injects itself into `bwrap` – the former setuid `bwrap` had previously denied `--cap-add` to any user except root. Consequently, the guard prevents any unlisted program from establishing its own namespace, yet it offers no defence against a targeted attack exploiting the allowed `bwrap`.
+
 ## Where the allowlist comes from
 
 `/etc/ditana/userns-allow.conf` holds one absolute path per line. Lines that are empty or start with `#` are ignored. A path that does not resolve aborts the run rather than being skipped: it means the list and the installed system have drifted apart, and the sandbox it was written for would fail later with nothing to point at.
